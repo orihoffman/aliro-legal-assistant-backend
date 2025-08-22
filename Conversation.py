@@ -1,6 +1,14 @@
 from playwright.async_api import async_playwright
 import asyncio
 import os
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
+
+# Access the variables
+google_password = os.getenv("GOOGLE_PASSWORD")
+google_email = os.getenv("GOOGLE_EMAIL")
 
 
 class ConversationSession:
@@ -10,40 +18,44 @@ class ConversationSession:
         self.browser = None
         self.context = None
         self.page = None
-        self.auth_path = "auth_state.json"
 
     async def start(self):
         """Start the conversation session by launching the browser and navigating to the chat page."""
         self.playwright = await async_playwright().start()
-        self.browser = await self.playwright.chromium.launch()
-
-        # Load saved login state if available
-        if os.path.exists(self.auth_path):
-            self.context = await self.browser.new_context(storage_state=self.auth_path)
-        else:
-            self.context = await self.browser.new_context()
-
+        self.browser = await self.playwright.chromium.launch()  # Set headless=False for debugging
+        self.context = await self.browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115 Safari/537.36",
+            locale="en-US",
+            viewport={"width": 1280, "height": 800}
+        )
         self.page = await self.context.new_page()
-        await self.page.goto("https://notebooklm.google.com/notebook/fef71e75-6992-48b7-8912-6955b19c99d9")
 
-        try:
-            # Wait for either input OR login
-            await self.page.wait_for_selector(
-                ".message-container input, .message-container textarea, input[type='email']", timeout=30000
-            )
+        await self.page.goto("https://notebooklm.google.com/notebook/fef71e75-6992-48b7-8912-6955b19c99d9", wait_until="domcontentloaded")
 
-            # Detect if login is needed
-            if await self.page.query_selector("input[type='email']"):
-                raise Exception("Login required. Session expired or not authenticated.")
+        title = await self.page.title()
+        print(f"[Debug] Page title: {title}")
 
-            print(f"Session {self.session_id} is ready to chat.")
+        if "Sign in" in title or "login" in title.lower():
+            print("Login required. Attempting login...")
 
-            # Save login state (only if newly logged in)
-            await self.context.storage_state(path=self.auth_path)
+            try:
+                await self._handle_login()
 
-        except Exception as e:
-            print(f"Error initializing session {self.session_id}: {e}")
-            await self.stop()
+                # After login, wait for the input field to ensure it's ready
+                await self.page.wait_for_selector(".message-container input, .message-container textarea", timeout=60000)
+                print(f"Session {self.session_id} logged in and ready.")
+
+            except Exception as e:
+                print(f"❌ Login failed: {e}")
+                await self.stop()
+        else:
+            try:
+                # Already authenticated
+                await self.page.wait_for_selector(".message-container input, .message-container textarea", timeout=60000)
+                print(f"Session {self.session_id} is already authenticated and ready.")
+            except Exception as e:
+                print(f"❌ Error reaching input field: {e}")
+                await self.stop()
 
     async def send_and_receive(self, message: str):
         """Send a message and stream the assistant's response."""
@@ -80,7 +92,7 @@ class ConversationSession:
                 if unchanged_count >= 5:
                     break
 
-                await asyncio.sleep(0.75)
+                await asyncio.sleep(1)
 
             return response_text
 
@@ -107,3 +119,57 @@ class ConversationSession:
         if self.playwright:
             await self.playwright.stop()
         print(f"Session {self.session_id} has been stopped.")
+
+    async def _handle_login(self):
+        try:
+            # Locate and fill email
+            email_input = await self.page.query_selector(
+                "input[type='email'], input[name='identifier'], input[autocomplete='username']"
+            )
+            if not email_input:
+                raise Exception("Could not find email input field.")
+
+            await email_input.fill(google_email)
+            print("✅ Filled email")
+            next_button = await self.page.query_selector("button:has-text('Next')")
+            if not next_button:
+                raise Exception("Could not find 'Next' button after email entry.")
+            await next_button.click()
+            print("✅ Clicked 'Next' after email")
+
+            # Locate and fill password
+            await self.page.wait_for_selector("input[type='password']", timeout=15000)
+            password_input = await self.page.query_selector("input[type='password']")
+            if not password_input:
+                raise Exception("Could not find password input field.")
+
+            await password_input.fill(google_password)
+            print("✅ Filled password")
+            next_button = await self.page.query_selector("button:has-text('Next')")
+            if not next_button:
+                raise Exception("Could not find 'Next' button after password entry.")
+            await next_button.click()
+            print("✅ Clicked 'Next' after password")
+
+            # Wait until conversation input is available
+            await self.page.wait_for_selector(".message-container input, .message-container textarea", timeout=60000)
+            print("✅ Logged in successfully")
+
+        except Exception as e:
+            raise Exception(f"Login sequence failed: {e}")
+
+
+if __name__ == "__main__":
+    import asyncio
+
+    async def save_auth():
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=False)
+            context = await browser.new_context()
+            page = await context.new_page()
+            await page.goto("https://notebooklm.google.com/")
+            print("Login manually and press ENTER here once done...")
+            input()
+            await browser.close()
+
+    asyncio.run(save_auth())
