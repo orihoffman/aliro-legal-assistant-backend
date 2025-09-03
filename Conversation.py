@@ -138,8 +138,8 @@ class ConversationSession:
             print("✅ Clicked 'Next' after email")
 
             # Locate and fill password
-            await self.page.wait_for_selector("input[type='password']", timeout=15000)
-            password_input = await self.page.query_selector("input[type='password']")
+            # await self.page.wait_for_selector("input[type='password']", timeout=15000)
+            password_input = await find_password_input(self.page, total_timeout=15000)
             if not password_input:
                 raise Exception("Could not find password input field.")
 
@@ -157,6 +157,89 @@ class ConversationSession:
 
         except Exception as e:
             raise Exception(f"Login sequence failed: {e}")
+        
+
+import re
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+
+async def find_password_input(page, total_timeout=30000):
+    """
+    Tries multiple robust strategies (including iframes & shadow DOM) to find a password input.
+    Returns a Locator (focused on a single element) or raises if none found.
+    """
+    per_try_timeout = max(2000, total_timeout // 6)
+
+    async def _first_visible(loc):
+        try:
+            await loc.first.wait_for(state="attached", timeout=per_try_timeout)
+            # Ensure it's actually actionable
+            el = loc.first
+            await el.wait_for(state="visible", timeout=per_try_timeout)
+            return el
+        except PlaywrightTimeoutError:
+            return None
+
+    # 0) Give the page a moment to settle (helps on cloud)
+    try:
+        await page.wait_for_load_state("domcontentloaded", timeout=per_try_timeout)
+    except PlaywrightTimeoutError:
+        pass
+    for state in ("networkidle", "load"):
+        try:
+            await page.wait_for_load_state(state, timeout=1500)
+            break
+        except PlaywrightTimeoutError:
+            continue
+
+    # 1) Obvious direct hits
+    candidates = [
+        page.get_by_label(re.compile(r"password", re.I)),
+        page.get_by_placeholder(re.compile(r"password", re.I)),
+        page.locator("input[type='password']"),
+        page.locator("css:light(input[type='password'])"),  # pierce shadow roots
+        page.locator("input[autocomplete='current-password'], input[autocomplete='new-password']"),
+        page.locator("input[name*='pass' i], input[id*='pass' i]"),
+        # Sometimes sites temporarily use type='text' but label/placeholder says password
+        page.locator("input[type='text'][name*='pass' i], input[type='text'][id*='pass' i]"),
+    ]
+
+    for loc in candidates:
+        el = await _first_visible(loc)
+        if el:
+            return el
+
+    # 2) Last-resort XPath sweep on the main page
+    xpath = (
+        "//input["
+        "contains(translate(@type,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'password') "
+        "or contains(translate(@name,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'pass') "
+        "or contains(translate(@id,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'pass')"
+        "]"
+    )
+    el = await _first_visible(page.locator(f"xpath={xpath}"))
+    if el:
+        return el
+
+    # 3) Check iframes (common on Microsoft/Google/Auth0 pages)
+    for frame in page.frames:
+        if frame is page.main_frame:
+            continue
+        frame_candidates = [
+            frame.get_by_label(re.compile(r"password", re.I)),
+            frame.get_by_placeholder(re.compile(r"password", re.I)),
+            frame.locator("input[type='password']"),
+            frame.locator("css:light(input[type='password'])"),
+            frame.locator("input[autocomplete='current-password'], input[autocomplete='new-password']"),
+            frame.locator("input[name*='pass' i], input[id*='pass' i]"),
+            frame.locator(f"xpath={xpath}"),
+        ]
+        for loc in frame_candidates:
+            el = await _first_visible(loc)
+            if el:
+                return el
+
+    raise Exception("Could not find a password input field (tried labels, placeholders, attrs, shadow DOM, and iframes).")
+
 
 
 if __name__ == "__main__":
